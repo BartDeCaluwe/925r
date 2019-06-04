@@ -8,9 +8,10 @@ os.chdir(os.path.normpath(os.path.join(os.path.abspath(__file__), os.pardir)))
 
 setup(
     name='ninetofiver',
-    version='0.0.1',
+    version='1.0.0',
     packages=find_packages(),
     include_package_data=True,
+    zip_safe=False,
     license='MIT License',
     description='A free and open source time and leave tracking application.',
     long_description=README,
@@ -31,4 +32,6 @@ setup(
         'Topic :: Internet :: WWW/HTTP',
         'Topic :: Internet :: WWW/HTTP :: Dynamic Content',
     ],
+    entry_points={
+    },
 )

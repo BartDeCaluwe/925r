@@ -1,0 +1,9 @@
+extends ninetofiver/emails/mail_generic.pug
+
+block content
+    p Dear {{ user }},
+    p Your timesheet has been marked as '{{ timesheet.status }}'.
+        | <br>
+        | More details can be found below.
+
+    include ninetofiver/emails/partials/timesheet_vertical.pug

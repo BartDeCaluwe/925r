@@ -13,9 +13,10 @@ import ldap
 import os
 import yaml
 
-from configurations import Configuration
+from configurations import Configuration, values
 from django_auth_ldap.config import LDAPSearch
 from django_auth_ldap.config import LDAPSearchUnion
+from ninetofiver.utils import get_django_environment
 
 CFG_FILE_PATH = os.path.expanduser(os.environ.get('CFG_FILE_PATH', '/etc/925r/config.yml'))
 
@@ -23,9 +24,10 @@ CFG_FILE_PATH = os.path.expanduser(os.environ.get('CFG_FILE_PATH', '/etc/925r/co
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+ENVIRONMENT = get_django_environment()
+
 
 class Base(Configuration):
-
     """Base configuration."""
 
     @classmethod
@@ -41,7 +43,7 @@ class Base(Configuration):
         try:
             with open(CFG_FILE_PATH, 'r') as f:
                 data = yaml.load(f)
-        except:
+        except BaseException:
             pass
 
         if data:
@@ -58,18 +60,22 @@ class Base(Configuration):
     SECRET_KEY = '$6_rj^w8_*ihrkohpckeq4028ai1*no1cw1vp*2%oe8+#gp1sj'
 
     # SECURITY WARNING: don't run with debug turned on in production!
-    DEBUG = True
+    DEBUG = False
 
-    ALLOWED_HOSTS = []
+    ALLOWED_HOSTS = ['localhost']
 
     # Apps included here will be included
     # in the test suite
     NINETOFIVER_APPS = [
         'ninetofiver',
+        'ninetofiver.api_v2'
     ]
 
     # Application definition
     INSTALLED_APPS = [
+        'whitenoise.runserver_nostatic',
+    ] + NINETOFIVER_APPS + [
+        'django_admin_select2',
         'django.contrib.admin',
         'django.contrib.auth',
         'django.contrib.contenttypes',
@@ -78,7 +84,7 @@ class Base(Configuration):
         'django.contrib.staticfiles',
         'rest_framework',
         'rest_framework_swagger',
-        # 'django_filters',
+        'django_filters',
         'rest_framework_filters',
         'corsheaders',
         'polymorphic',
@@ -88,13 +94,22 @@ class Base(Configuration):
         'django_countries',
         'rangefilter',
         'django_admin_listfilter_dropdown',
-#        'django_extensions'        
-    ] + NINETOFIVER_APPS
+        'silk',
+        'wkhtmltopdf',
+        'django_tables2',
+        'phonenumber_field',
+        'import_export',
+        'adminsortable',
+        'explorer',
+        'logentry_admin',
+    ]
 
     MIDDLEWARE = [
-        'django.middleware.security.SecurityMiddleware',
-        'django.contrib.sessions.middleware.SessionMiddleware',
+        'silk.middleware.SilkyMiddleware',
         'corsheaders.middleware.CorsMiddleware',
+        'django.middleware.security.SecurityMiddleware',
+        'whitenoise.middleware.WhiteNoiseMiddleware',
+        'django.contrib.sessions.middleware.SessionMiddleware',
         'django.middleware.common.CommonMiddleware',
         'django.middleware.csrf.CsrfViewMiddleware',
         'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -119,6 +134,7 @@ class Base(Configuration):
                 ],
                 'loaders': [
                     ('pypugjs.ext.django.Loader', (
+                        'app_namespace.Loader',
                         'django.template.loaders.filesystem.Loader',
                         'django.template.loaders.app_directories.Loader',
                     )),
@@ -132,20 +148,19 @@ class Base(Configuration):
 
     # Database
     # https://docs.djangoproject.com/en/1.10/ref/settings/#databases
-
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.mysql',
-            'NAME': 'YAYATA',
-            'USER': 'root',
-            'PASSWORD': 'rootroot',
-            'HOST': 'localhost',
-            'PORT': '3306',
-            'TEST': {
-                'NAME': 'test_YAYATA',
-                'CHARSET': 'utf8',
+            'HOST': 'mysql.{env}.925r.local'.format(env=ENVIRONMENT),
+            'PORT': os.getenv('MYSQL_PORT', '3306'),
+            'NAME': os.getenv('MYSQL_DB', 'ninetofiver'),
+            'USER': os.getenv('MYSQL_USER', 'ninetofiver'),
+            'PASSWORD': os.getenv('MYSQL_PASSWORD', ''),
+            'OPTIONS': {
+                'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
             },
-        }
+            'CONN_MAX_AGE': 600,
+        },
     }
 
     # Password validation
@@ -185,14 +200,7 @@ class Base(Configuration):
     STATIC_URL = '/static/'
 
     # User-uploaded files
-    MEDIA_ROOT = os.path.join(BASE_DIR, 'media/')
-
-    # Caching
-    CACHES = {
-        'default': {
-            'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
-        }
-    }
+    MEDIA_ROOT = values.Value(os.path.join(BASE_DIR, 'media/'))
 
     # Auth
     LOGIN_URL = 'login'
@@ -205,6 +213,7 @@ class Base(Configuration):
             'oauth2_provider.ext.rest_framework.OAuth2Authentication',
             'rest_framework.authentication.SessionAuthentication',
             'rest_framework.authentication.BasicAuthentication',
+            'ninetofiver.authentication.ApiKeyAuthentication',
         ),
         'DEFAULT_RENDERER_CLASSES': (
             'rest_framework.renderers.JSONRenderer',
@@ -213,6 +222,7 @@ class Base(Configuration):
         'DEFAULT_FILTER_BACKENDS': (
             'django_filters.rest_framework.DjangoFilterBackend',
         ),
+        'EXCEPTION_HANDLER': 'ninetofiver.exceptions.exception_handler',
         'TEST_REQUEST_DEFAULT_FORMAT': 'json',
         'DEFAULT_PAGINATION_CLASS': 'ninetofiver.pagination.CustomizablePageNumberPagination',
         'PAGE_SIZE': 25,
@@ -243,6 +253,22 @@ class Base(Configuration):
         'VALIDATOR_URL': None,
     }
 
+    # Profiling
+    SILKY_AUTHENTICATION = True  # User must login
+    SILKY_AUTHORISATION = True  # User must have permissions
+    SILKY_MAX_REQUEST_BODY_SIZE = 0
+    SILKY_MAX_RESPONSE_BODY_SIZE = 0
+    SILKY_META = True
+    SILKY_MAX_RECORDED_REQUESTS = 1000
+    SILKY_MAX_RECORDED_REQUESTS_CHECK_PERCENT = 1
+    SILKY_INTERCEPT_PERCENT = 5
+
+    # Django SQL explorer
+    EXPLORER_CONNECTIONS = { 'Default': 'default' }
+    EXPLORER_DEFAULT_CONNECTION = 'default'
+    EXPLORER_SCHEMA_EXCLUDE_TABLE_PREFIXES = []
+    EXPLORER_PERMISSION_CHANGE = lambda env: lambda u: u.is_superuser
+
     # Crispy forms
     CRISPY_TEMPLATE_PACK = 'bootstrap3'
 
@@ -251,7 +277,7 @@ class Base(Configuration):
 
     # Registration
     ACCOUNT_ACTIVATION_DAYS = 7
-    REGISTRATION_OPEN = True
+    REGISTRATION_OPEN = False
 
     # CORS
     CORS_ORIGIN_ALLOW_ALL = True
@@ -260,6 +286,7 @@ class Base(Configuration):
     SETTINGS_EXPORT = [
         'DEBUG',
         'REGISTRATION_OPEN',
+        'BASE_URL',
     ]
 
     # Authentication using LDAP
@@ -281,18 +308,59 @@ class Base(Configuration):
         'last_name': 'sn',
     }
     AUTH_LDAP_ALWAYS_UPDATE_USER = True
+    AUTH_LDAP_GLOBAL_OPTIONS = {
+        ldap.OPT_X_TLS_REQUIRE_CERT: ldap.OPT_X_TLS_ALLOW,
+    }
 
-    # REDMINE 
-    REDMINE_URL = None 
-    REDMINE_API_KEY = None
+    # PDFs
+    WKHTMLTOPDF_CMD_OPTIONS = {
+        'encoding': 'utf8',
+        'quiet': True,
+        'margin-bottom': '10mm',
+        'margin-left': '5mm',
+        'margin-right': '5mm',
+        'margin-top': '10mm',
+    }
 
+    # REDMINE
+    REDMINE_URL = values.Value(None)
+    REDMINE_API_KEY = values.Value(None)
+    REDMINE_ISSUE_CONTRACT_FIELD = values.Value('925r_contract')
+
+    EMAIL_HOST = values.Value('localhost')
+    EMAIL_PORT = values.Value(25)
+    EMAIL_BACKEND = values.Value('django.core.mail.backends.smtp.EmailBackend')
+    DEFAULT_FROM_EMAIL = values.Value('noreply@example.org')
+
+    # Absolute URL generation without request info
+    BASE_URL = values.Value('http://localhost:8000')
+    # Default starting hour for working days
+    DEFAULT_WORKING_DAY_STARTING_HOUR = 9
+
+    # Mattermost integration
+    MATTERMOST_INCOMING_WEBHOOK_URL = values.Value(None)
+    MATTERMOST_PERFORMANCE_REMINDER_NOTIFICATION_ENABLED = values.Value(True)
+    MATTERMOST_TIMESHEET_REMINDER_NOTIFICATION_ENABLED = values.Value(True)
+
+    # Rocketchat integration
+    ROCKETCHAT_INCOMING_WEBHOOK_URL = values.Value(None)
+    ROCKETCHAT_PERFORMANCE_REMINDER_NOTIFICATION_ENABLED = values.Value(True)
+    ROCKETCHAT_TIMESHEET_REMINDER_NOTIFICATION_ENABLED = values.Value(True)
 
 
 class Dev(Base):
-
     """Dev configuration."""
 
-    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+    DEBUG = True
+
+    ALLOWED_HOSTS = ['*']
+
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        }
+    }
 
     # Logging
     LOGGING = {
@@ -332,84 +400,49 @@ class Dev(Base):
         }
     }
 
-class Prod(Base):
-  
-    """Prod configuration."""
-
-    DEBUG = False
-    ALLOWED_HOSTS = ['localhost']
-
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': os.path.join(BASE_DIR, 'db-prod.sqlite3'),
-        }
-    }
+    INTERNAL_IPS = Base.INTERNAL_IPS + [
+        '127.0.0.1',
+    ]
 
     CACHES = {
         'default': {
-            'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
-            'LOCATION': os.path.expanduser('~/.ninetofiver_cache'),
-            'TIMEOUT': 60 * 60 * 24 * 7 * 365,
-            'OPTIONS': {
-                'MAX_ENTRIES': 10000
-            }
+            'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
         }
     }
 
-    REGISTRATION_OPEN = False
+    # Profiling
+    SILKY_INTERCEPT_PERCENT = 100
+
+    REGISTRATION_OPEN = True
+
+
+class Prod(Base):
+    """Prod configuration."""
+
     # Logging
     LOGGING = {
         'version': 1,
         'disable_existing_loggers': False,
         'formatters': {
-            'verbose': {
-                'format': '%(levelname)s %(asctime)s %(module)s %(process)d %(thread)d %(message)s'
-            },
             'simple': {
                 'format': '%(levelname)s %(message)s'
             },
         },
-        'filters': {
-            'require_debug_true': {
-                '()': 'django.utils.log.RequireDebugTrue',
-            },
-        },
         'handlers': {
-            'syslog': {
-                'class': 'logging.handlers.SysLogHandler',
-                'formatter': 'verbose',
-                'facility': 'user',
-            },
             'console': {
-                'level': 'DEBUG',
-                'filters': ['require_debug_true'],
                 'class': 'logging.StreamHandler',
                 'formatter': 'simple'
             },
         },
-         'loggers': {
-            'ninetofiver': {
-                'handlers': ['console', 'syslog'],
+        'loggers': {
+            '': {
+                'handlers': ['console'],
                 'level': 'INFO',
-            }
+                'propagate': False,
+            },
         }
     }
 
 
-class TravisCI(Base):
-
-    """Travis-CI configuration."""
-
-    DATABASES = {
-        'default': {
-            'ENGINE': 'django.db.backends.mysql',
-            'NAME': 'travis_ci_db',
-            'USER': 'root',
-            'PASSWORD': '',
-            'HOST': '127.0.0.1',
-        }
-    }
-
-    REDMINE_URL = os.getenv('REDMINE_URL')
-    REDMINE_API_KEY = os.getenv('REDMINE_API_KEY')
+class Stag(Prod):
+    """Stag configuration."""

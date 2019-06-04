@@ -1,16 +1,9 @@
 language: python
 python:
-  - "3.4"
-  - "3.5"
+  - "3.6"
 install:
-  - pip install coveralls
-  - pip install .
-  - pip install -r requirements.txt
-services:
-  - mysql
-env:
-  - DJANGO=1.10.4 DB=mysql DJANGO_CONFIGURATION=TravisCI
+  - pip install tox coveralls
 script:
-  - coverage run --source=ninetofiver manage.py testninetofiver
+  - tox
 after_success:
   - coveralls

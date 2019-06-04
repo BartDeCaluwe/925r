@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.vscode/
 .idea/
 .ropeproject/
 dist/
@@ -10,5 +11,9 @@ MANIFEST
 /static/
 ninetofiver_venv/
 docs/_build/
-/media/
+/media/*
+!/media/.gitkeep
 *.log
+.tox/
+.env
+.coverage

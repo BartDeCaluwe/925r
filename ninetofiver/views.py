@@ -1,17 +1,21 @@
-from django.contrib.auth import models as auth_models
+from django.contrib.auth import models as auth_models, mixins as auth_mixins
 from django.contrib.auth.decorators import login_required
+from django.contrib.admin.views.decorators import staff_member_required
+from django.contrib.contenttypes.models import ContentType
 from django.shortcuts import get_object_or_404
-from django.shortcuts import render
-from decimal import Decimal
-from datetime import datetime, timedelta, time
-from calendar import monthcalendar, weekday, monthrange, day_name
-from collections import Counter
+from django.shortcuts import render, redirect
+from django.forms.models import modelform_factory
+from django.views import generic as generic_views
+from django.db import transaction
+from django.utils.translation import ugettext_lazy as _
 from django.utils import timezone
-from django.core.exceptions import ValidationError, ObjectDoesNotExist
+from django.urls import reverse_lazy
+from decimal import Decimal
 from ninetofiver import filters
 from ninetofiver import models
 from ninetofiver import serializers
-from ninetofiver.viewsets import GenericHierarchicalReadOnlyViewSet
+from ninetofiver import redmine
+from ninetofiver import feeds
 from rest_framework import parsers
 from rest_framework import permissions
 from rest_framework import response
@@ -25,18 +29,86 @@ from rest_framework.decorators import renderer_classes
 from rest_framework.renderers import CoreJSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.schemas import SchemaGenerator
-from rest_framework_swagger import renderers
 from rest_framework_swagger.renderers import OpenAPIRenderer
 from rest_framework_swagger.renderers import SwaggerUIRenderer
-from ninetofiver.redmine.views import get_redmine_user_time_entries
-from ninetofiver.redmine.serializers import RedmineTimeEntrySerializer
-
-import ninetofiver.settings as settings
-
+from rest_framework.authtoken import models as authtoken_models
+from ninetofiver import settings, tables, calculation, pagination
+from ninetofiver.utils import month_date_range, dates_in_range
+from django.db.models import Q, F, Sum, Prefetch, DecimalField
+from django_tables2 import RequestConfig
+from django_tables2.export.export import TableExport
+from datetime import datetime, date, timedelta
+from wkhtmltopdf.views import PDFTemplateView
+from dateutil import parser
+from dateutil.relativedelta import relativedelta
+from collections import OrderedDict
 import logging
+import copy
+
+
 logger = logging.getLogger(__name__)
 
+
+# Reused classes
+
+class BaseTimesheetContractPdfExportServiceAPIView(PDFTemplateView, generics.GenericAPIView):
+    """Export a timesheet contract to PDF."""
+
+    filename = 'timesheet_contract.pdf'
+    template_name = 'ninetofiver/timesheets/timesheet_contract_pdf_export.pug'
+
+    def resolve_user_timesheet_contracts(self, context):
+        """Resolve the users, timesheets and contracts for this export."""
+        raise NotImplementedError()
+
+    def render_to_response(self, context, **response_kwargs):
+        items = self.resolve_user_timesheet_contracts(context)
+        ctx = {
+            'items': [],
+        }
+
+        for item in items:
+            item_ctx = {
+                'user': item[0],
+                'timesheet': item[1],
+                'contract': item[2],
+            }
+
+            item_ctx['activity_performances'] = (models.ActivityPerformance.objects
+                                                 .filter(timesheet=item_ctx['timesheet'],
+                                                         contract=item_ctx['contract'])
+                                                 .order_by('date')
+                                                 .select_related('performance_type')
+                                                 .all())
+            item_ctx['total_performed_hours'] = sum([x.duration for x in item_ctx['activity_performances']])
+            item_ctx['total_performed_days'] = round(item_ctx['total_performed_hours'] / 8, 2)
+
+            item_ctx['total_normalized_performed_hours'] = sum([x.normalized_duration for x in item_ctx['activity_performances']])
+            item_ctx['total_normalized_performed_days'] = round(item_ctx['total_normalized_performed_hours'] / 8, 2)
+
+            item_ctx['standby_performances'] = (models.StandbyPerformance.objects
+                                                .filter(timesheet=item_ctx['timesheet'], contract=item_ctx['contract'])
+                                                .order_by('date')
+                                                .all())
+            item_ctx['total_standby_days'] = round(len(item_ctx['standby_performances']), 2)
+
+            # Create a performances dict, indexed by date
+            performances = {}
+            [performances.setdefault(str(x.date), {}).setdefault('activity', []).append(x)
+                for x in item_ctx['activity_performances']]
+            [performances.setdefault(str(x.date), {}).setdefault('standby', []).append(x)
+                for x in item_ctx['standby_performances']]
+            # Sort performances dict by date
+            item_ctx['performances'] = OrderedDict()
+            for day in sorted(performances):
+                item_ctx['performances'][day] = performances[day]
+
+            ctx['items'].append(item_ctx)
+
+        return super().render_to_response(ctx, **response_kwargs)
+
+
+# Homepage and others
 def home_view(request):
     """Homepage."""
     context = {}
@@ -50,699 +122,994 @@ def account_view(request):
     return render(request, 'ninetofiver/account/index.pug', context)
 
 
-@api_view(exclude_from_schema=True)
-@renderer_classes([OpenAPIRenderer, SwaggerUIRenderer, CoreJSONRenderer])
-@permission_classes((permissions.IsAuthenticated,))
-def schema_view(request):
-    """API documentation."""
-    generator = schemas.SchemaGenerator(title='Ninetofiver API')
-    return response.Response(generator.get_schema(request=request))
+@login_required
+def api_docs_view(request):
+    """API docs view page."""
+    context = {}
+    return render(request, 'ninetofiver/api_docs/index.pug', context)
 
 
-class UserViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    API endpoint that allows users to be viewed or edited.
-    """
-    queryset = auth_models.User.objects.distinct().order_by('-date_joined')
-    serializer_class = serializers.UserSerializer
-    filter_class = filters.UserFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+@login_required
+def api_docs_redoc_view(request):
+    """API docs redoc view page."""
+    context = {}
+    return render(request, 'ninetofiver/api_docs/redoc.pug', context)
 
 
-class GroupViewSet(viewsets.ReadOnlyModelViewSet):
-    """
-    API endpoint that allows groups to be viewed or edited.
-    """
-    queryset = auth_models.Group.objects.all()
-    serializer_class = serializers.GroupSerializer
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+@login_required
+def api_docs_swagger_ui_view(request):
+    """API docs swagger ui view page."""
+    context = {}
+    return render(request, 'ninetofiver/api_docs/swagger_ui.pug', context)
 
 
-class CompanyViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows companies to be viewed or edited.
-    """
-    queryset = models.Company.objects.all()
-    serializer_class = serializers.CompanySerializer
-    filter_class = filters.CompanyFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+class ApiKeyCreateView(auth_mixins.LoginRequiredMixin, generic_views.CreateView):
+    """View used to create an API key."""
+
+    template_name = 'ninetofiver/api_keys/create.pug'
+    success_url = reverse_lazy('api-key-list')
+
+    def get_form_class(self):
+        """Get the form class."""
+        return modelform_factory(models.ApiKey, fields=('name', 'read_only',))
+
+    def form_valid(self, form):
+        form.instance.user = self.request.user
+        return super().form_valid(form)
 
 
-class EmploymentContractTypeViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows employment contract types to be viewed or edited.
-    """
-    queryset = models.EmploymentContractType.objects.all()
-    serializer_class = serializers.EmploymentContractTypeSerializer
-    filter_class = filters.EmploymentContractTypeFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+class ApiKeyListView(auth_mixins.LoginRequiredMixin, generic_views.ListView):
+    """List view for all API keys owned by the user."""
+
+    context_object_name = 'tokens'
+    template_name = 'ninetofiver/api_keys/list.pug'
+
+    def get_queryset(self):
+        return models.ApiKey.objects.filter(user=self.request.user)
 
 
-class EmploymentContractViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows employment contracts to be viewed or edited.
-    """
-    queryset = models.EmploymentContract.objects.all()
-    serializer_class = serializers.EmploymentContractSerializer
-    filter_class = filters.EmploymentContractFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+class ApiKeyDeleteView(auth_mixins.LoginRequiredMixin, generic_views.DeleteView):
+    """View used to delete an API key owned by the user."""
+
+    context_object_name = "apikey"
+    success_url = reverse_lazy('api-key-list')
+    template_name = 'ninetofiver/api_keys/delete.pug'
+
+    def get_queryset(self):
+        return models.ApiKey.objects.filter(user=self.request.user)
 
 
-class WorkScheduleViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows workschedules to be viewed or edited.
-    """
-    queryset = models.WorkSchedule.objects.all()
-    serializer_class = serializers.WorkScheduleSerializer
-    filter_class = filters.WorkScheduleFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+# Admin-only
+@staff_member_required
+def admin_leave_approve_view(request, leave_pk):
+    """Approve the selected leaves."""
+    leave_pks = list(map(int, leave_pk.split(',')))
+    return_to_referer = request.GET.get('return', 'false').lower() == 'true'
 
+    leaves = models.Leave.objects.filter(id__in=leave_pks, status=models.STATUS_PENDING)
 
-class UserRelativeViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows user relatives to be viewed or edited.
-    """
-    queryset = models.UserRelative.objects.all()
-    serializer_class = serializers.UserRelativeSerializer
-    filter_class = filters.UserRelativeFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+    for leave in leaves:
+        leave.status = models.STATUS_APPROVED
+        leave.save()
 
-
-class HolidayViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows holidays to be viewed or edited.
-    """
-    queryset = models.Holiday.objects.all()
-    serializer_class = serializers.HolidaySerializer
-    filter_class = filters.HolidayFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class LeaveTypeViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows leave types to be viewed or edited.
-    """
-    queryset = models.LeaveType.objects.all()
-    serializer_class = serializers.LeaveTypeSerializer
-    filter_class = filters.LeaveTypeFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class LeaveViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows leaves to be viewed or edited.
-    """
-    queryset = models.Leave.objects.all()
-    serializer_class = serializers.LeaveSerializer
-    filter_class = filters.LeaveFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class LeaveDateViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows leave dates to be viewed or edited.
-    """
-    queryset = models.LeaveDate.objects.all()
-    serializer_class = serializers.LeaveDateSerializer
-    filter_class = filters.LeaveDateFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class PerformanceTypeViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows performance types to be viewed or edited.
-    """
-    queryset = models.PerformanceType.objects.all()
-    serializer_class = serializers.PerformanceTypeSerializer
-    filter_class = filters.PerformanceTypeFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class ContractViewSet(GenericHierarchicalReadOnlyViewSet):
-    """
-    API endpoint that allows contracts to be viewed or edited.
-    """
-    queryset = models.Contract.objects.all()
-    serializer_class = serializers.ContractSerializer
-    serializer_classes = {
-        models.ProjectContract: serializers.ProjectContractSerializer,
-        models.ConsultancyContract: serializers.ConsultancyContractSerializer,
-        models.SupportContract: serializers.SupportContractSerializer,
+    context = {
+        'leaves': leaves,
     }
-    filter_class = filters.ContractFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+
+    if return_to_referer and request.META.get('HTTP_REFERER', None):
+        return redirect(request.META.get('HTTP_REFERER'))
+
+    return render(request, 'ninetofiver/admin/leaves/approve.pug', context)
 
 
-class ProjectContractViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows project contracts to be viewed or edited.
-    """
-    queryset = models.ProjectContract.objects.all()
-    serializer_class = serializers.ProjectContractSerializer
-    filter_class = filters.ProjectContractFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+@staff_member_required
+def admin_leave_reject_view(request, leave_pk):
+    """Reject the selected leaves."""
+    leave_pks = list(map(int, leave_pk.split(',')))
+    return_to_referer = request.GET.get('return', 'false').lower() == 'true'
 
+    leaves = models.Leave.objects.filter(id__in=leave_pks, status=models.STATUS_PENDING)
 
-class ConsultancyContractViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows consultancy contracts to be viewed or edited.
-    """
-    queryset = models.ConsultancyContract.objects.all()
-    serializer_class = serializers.ConsultancyContractSerializer
-    filter_class = filters.ConsultancyContractFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+    for leave in leaves:
+        leave.status = models.STATUS_REJECTED
+        leave.save()
 
-
-class SupportContractViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows support contracts to be viewed or edited.
-    """
-    queryset = models.SupportContract.objects.all()
-    serializer_class = serializers.SupportContractSerializer
-    filter_class = filters.SupportContractFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class ContractRoleViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows contract roles to be viewed or edited.
-    """
-    queryset = models.ContractRole.objects.all()
-    serializer_class = serializers.ContractRoleSerializer
-    filter_class = filters.ContractRoleFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class ContractUserViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows contract users to be viewed or edited.
-    """
-    queryset = models.ContractUser.objects.all()
-    serializer_class = serializers.ContractUserSerializer
-    filter_class = filters.ContractUserFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class ContractGroupViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows contract groups to be viewed or edited.
-    """
-    queryset = models.ContractGroup.objects.all()
-    serializer_class = serializers.ContractGroupSerializer
-    filter_class = filters.ContractGroupFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class ProjectEstimateViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows project estimates to be viewed or edited.
-    """
-    queryset = models.ProjectEstimate.objects.all()
-    serializer_class = serializers.ProjectEstimateSerializer
-    filter_class = filters.ProjectEstimateFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class TimesheetViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows timesheets to be viewed or edited.
-    """
-    queryset = models.Timesheet.objects.all()
-    serializer_class = serializers.TimesheetSerializer
-    filter_class = filters.TimesheetFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class WhereaboutViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows whereabouts to be viewed or edited.
-    """
-    queryset = models.Whereabout.objects.all()
-    serializer_class = serializers.WhereaboutSerializer
-    filter_class = filters.WhereaboutFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-
-
-class PerformanceViewSet(GenericHierarchicalReadOnlyViewSet):
-    """
-    API endpoint that allows performances to be viewed or edited.
-    """
-    queryset = models.Performance.objects.all()
-    serializer_class = serializers.PerformanceSerializer
-    serializer_classes = {
-        models.StandbyPerformance: serializers.StandbyPerformanceSerializer,
-        models.ActivityPerformance: serializers.ActivityPerformanceSerializer,
+    context = {
+        'leaves': leaves,
     }
-    filter_class = filters.PerformanceFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+
+    if return_to_referer and request.META.get('HTTP_REFERER', None):
+        return redirect(request.META.get('HTTP_REFERER'))
+
+    return render(request, 'ninetofiver/admin/leaves/reject.pug', context)
 
 
-class ActivityPerformanceViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows activity performances to be viewed or edited.
-    """
-    queryset = models.ActivityPerformance.objects.all()
-    serializer_class = serializers.ActivityPerformanceSerializer
-    filter_class = filters.ActivityPerformanceFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+@staff_member_required
+def admin_timesheet_close_view(request, timesheet_pk):
+    """Close the selected timesheets."""
+    timesheet_pks = list(map(int, timesheet_pk.split(',')))
+    return_to_referer = request.GET.get('return', 'false').lower() == 'true'
+
+    timesheets = models.Timesheet.objects.filter(id__in=timesheet_pks, status=models.STATUS_PENDING)
+
+    for timesheet in timesheets:
+        timesheet.status = models.STATUS_CLOSED
+        timesheet.save()
+
+    context = {
+        'timesheets': timesheets,
+    }
+
+    if return_to_referer and request.META.get('HTTP_REFERER', None):
+        return redirect(request.META.get('HTTP_REFERER'))
+
+    return render(request, 'ninetofiver/admin/timesheets/close.pug', context)
 
 
-class StandbyPerformanceViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows standby performances to be viewed or edited.
-    """
-    queryset = models.StandbyPerformance.objects.all()
-    serializer_class = serializers.StandbyPerformanceSerializer
-    filter_class = filters.StandbyPerformanceFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
+@staff_member_required
+def admin_timesheet_activate_view(request, timesheet_pk):
+    """Activate the selected timesheets."""
+    timesheet_pks = list(map(int, timesheet_pk.split(',')))
+    return_to_referer = request.GET.get('return', 'false').lower() == 'true'
+
+    timesheets = models.Timesheet.objects.filter(id__in=timesheet_pks, status=models.STATUS_PENDING)
+
+    for timesheet in timesheets:
+        timesheet.status = models.STATUS_ACTIVE
+        timesheet.save()
+
+    context = {
+        'timesheets': timesheets,
+    }
+
+    if return_to_referer and request.META.get('HTTP_REFERER', None):
+        return redirect(request.META.get('HTTP_REFERER'))
+
+    return render(request, 'ninetofiver/admin/timesheets/activate.pug', context)
 
 
-class AttachmentViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows attachments to be viewed or edited.
-    """
-    queryset = models.Attachment.objects.all()
-    serializer_class = serializers.AttachmentSerializer
-    filter_class = filters.AttachmentFilter
-    permission_classes = (permissions.IsAuthenticated, permissions.DjangoModelPermissions)
-    parser_classes = (parsers.MultiPartParser, parsers.FileUploadParser, parsers.JSONParser)
+@staff_member_required
+def admin_report_index_view(request):
+    """Report index."""
+    context = {
+        'title': _('Reports'),
+        'today': date.today(),
+        'last_week': date.today() - relativedelta(weeks=1),
+        'next_month': date.today() + relativedelta(months=1),
+        'two_months_from_now': date.today() + relativedelta(months=2),
+    }
+
+    return render(request, 'ninetofiver/admin/reports/index.pug', context)
 
 
-class TimeEntryImportServiceAPIView(APIView):
-    """
-    Gets time entries from external sources and returns them to be imported as performances.
-    """
-    permission_classes = (permissions.IsAuthenticated,)
+@staff_member_required
+def admin_report_timesheet_contract_overview_view(request):
+    """Timesheet contract overview report."""
+    fltr = filters.AdminReportTimesheetContractOverviewFilter(request.GET, models.Timesheet.objects)
+    timesheets = fltr.qs.select_related('user')
 
-    def get(self, request, format=None):
-        # If Redmine credentials are provided
-        if settings.REDMINE_URL and settings.REDMINE_API_KEY:
-            redmine_id = models.UserInfo.objects.get(user_id=request.user.id).redmine_id
-            if redmine_id:
-                redmine_time_entries = get_redmine_user_time_entries(user_id=redmine_id, params=request.query_params)
-                data = RedmineTimeEntrySerializer(
-                    instance=redmine_time_entries, many=True).data
-        return Response(data)
+    contracts = (models.Contract.objects.all())
 
+    try:
+        contract_ids = list(map(int, request.GET.getlist('performance__contract', [])))
+    except Exception:
+        contract_ids = None
+    try:
+        contract_types = list(map(str, request.GET.getlist('performance__contract__polymorphic_ctype__model', [])))
+    except Exception:
+        contract_types = None
+    try:
+        contract_companies = list(map(int, request.GET.getlist('performance__contract__company', [])))
+    except Exception:
+        contract_companies = None
+    try:
+        contract_customers = list(map(int, request.GET.getlist('performance__contract__customer', [])))
+    except Exception:
+        contract_customers = None
+    try:
+        contract_groups = list(map(int, request.GET.getlist('performance__contract__contract_groups', [])))
+    except Exception:
+        contract_groups = None
 
-class MonthInfoServiceAPIView(APIView):
-    """
-    Calculates and returns information from a given month.
-    Returns: hours_required of a given month and user
-    (as a string because decimal serialization can cause precision loss).
-    """
-    permission_classes = (permissions.IsAuthenticated,)
+    if contract_ids:
+        contracts = contracts.filter(id__in=contract_ids)
+    if contract_types:
+        contracts = contracts.filter(polymorphic_ctype__model__in=contract_types)
+    if contract_companies:
+        contracts = contracts.filter(company__id__in=contract_companies)
+    if contract_customers:
+        contracts = contracts.filter(customer__id__in=contract_customers)
+    if contract_groups:
+        contracts = contracts.filter(contract_groups__id__in=contract_groups)
 
-    def get(self, request, format=None):
-        # get user from params, defaults to the current user if user is omitted.
-        user = request.query_params.get('user_id') or request.user
-        # get month from params, defaults to the current month if month is omitted.
-        month = int(request.query_params.get('month') or datetime.now().month)
-        data = {}
-        data['hours_required'] = self.total_hours_required(user, month)
-        data['hours_performed'] = self.hours_performed(user, month)
-        serializer = serializers.MonthInfoSerializer(data=data)
-        serializer.is_valid(raise_exception=True)
-        return Response(serializer.data)
+    contracts = contracts.values_list('id', flat=True)
 
-    def total_hours_required(self, user, month):
-        total = 0
-        # Calculate total hours required.
-        try:
-            employmentcontract = models.EmploymentContract.objects.get(user_id=user)
-        except ObjectDoesNotExist as oe:
-            return Response('Failed to get employmentcontract' + str(oe), status=status.HTTP_400_BAD_REQUEST)
-        work_schedule = models.WorkSchedule.objects.get(pk=employmentcontract.work_schedule.id)
-    
+    data = []
+    for timesheet in timesheets:
+        date_range = timesheet.get_date_range()
+        range_info = calculation.get_range_info([timesheet.user], date_range[0], date_range[1], summary=True)
 
-        year = datetime.now().year
-        # List that contains the amount of weekdays of the given month.
-        start_date = datetime(year, month, 1)
-        end_date = datetime(year, month, monthrange(year, month)[1])
-        days_count = {}
-
-        for i in range((end_date - start_date).days + 1):
-            day = day_name[(start_date + timedelta(days=i)).weekday()]
-            days_count[day] = days_count[day] + 1 if day in days_count else 1
-
-        # Caluculate total hours required to work according to work schedule.
-        total += work_schedule.monday * days_count['Monday']
-        total += work_schedule.tuesday * days_count['Tuesday']
-        total += work_schedule.wednesday * days_count['Wednesday']
-        total += work_schedule.thursday * days_count['Thursday']
-        total += work_schedule.friday * days_count['Friday']
-        total += work_schedule.saturday * days_count['Saturday']
-        total += work_schedule.sunday * days_count['Sunday']
-        logger.debug('total: ' + str(total))
-        
-        # Subtract holdays from total.
-        try:
-            user_country = models.UserInfo.objects.get(user_id=user).country
-        except ObjectDoesNotExist as oe:
-            return Response('Failed to get user country: ' + str(oe), status=status.HTTP_400_BAD_REQUEST)
-        
-        holidays = models.Holiday.objects.filter(country=user_country).filter(date__month=month)
-        for holiday in holidays:
-            total -= 8
-        logger.debug('total after holidays: ' + str(total))
-
-        DAY_START = '09:00'
-        DAY_END = '17:30'
-        DAY_DURATION = 8
-        RANGE_START = timezone.make_aware(datetime(year, month, 1, 0, 0, 0, 0), timezone.get_current_timezone())
-        RANGE_END = timezone.make_aware(datetime(year, month, monthrange(year, month)[1], 0, 0, 0), timezone.get_current_timezone())
-
-        # Get all approved leaves of the user.
-        leaves = models.Leave.objects.filter(user_id=user, status=models.Leave.STATUS.APPROVED)
-        # Filter out those who don't start or end in the current month.
-        result = list(filter(lambda x: (x.leavedate_set.first().starts_at >= RANGE_START and x.leavedate_set.first().starts_at <= RANGE_END) or (x.leavedate_set.last().starts_at >= RANGE_START and x.leavedate_set.last().starts_at <= RANGE_END), leaves))
-        
-        # Subtract leaves from total.
-        for leave in result:
-            leavedates = leave.leavedate_set.all()
-
-            first_leavedate = leavedates.first()
-            last_leavedate = leavedates.last()
-
-            for leavedate in leavedates:
-                if leavedate.starts_at >= RANGE_START:
-                    first_leavedate = leavedate
-                    break
-            for leavedate in leavedates:
-                if leavedate.ends_at >= RANGE_END:
-                    last_leavedate = leavedate
-                    break
-            # first leavedate time deltas
-            fld_day_start_delta = datetime.strptime(str(first_leavedate.starts_at.time()), '%H:%M:%S') - (datetime.strptime(DAY_START, '%H:%M'))
-            fld_day_end_delta = (datetime.strptime(DAY_END, '%H:%M')) - datetime.strptime(str(first_leavedate.ends_at.time()), '%H:%M:%S') 
-            # subtract first leavedate time deltas from total
-            hours_required = round(fld_day_start_delta.seconds/3600, 1) + round(fld_day_end_delta.seconds/3600, 1)
-            hours_required = hours_required if hours_required <= 8 else 8
-            total -= Decimal(hours_required)
-            
-            # if the leave spans more than one day: calculate last leavedate time deltas
-            if len(leavedates) > 1:
-                lld_day_start_delta = datetime.strptime(str(last_leavedate.starts_at.time()), '%H:%M:%S') - datetime.strptime(DAY_START, '%H:%M')
-                lld_day_end_delta = datetime.strptime(DAY_END, '%H:%M') - datetime.strptime(str(last_leavedate.ends_at.time()), '%H:%M:%S') 
-                # subtract last leavedate time deltas from total
-                hours_required = round(lld_day_start_delta.seconds/3600, 1) + round(lld_day_end_delta.seconds/3600, 1)
-                hours_required = hours_required if hours_required <= 8 else 8
-                total -= Decimal(hours_required)
-            
-            # Check if the leave spans more days than one.
-            if len(leavedates) > 1:
-                for leavedate in leavedates:
-                    # subtract a whole day if the leavedate is between the first leavedate and the last leavedate (of the specified month)
-                    if leavedate.starts_at.weekday() < 5 and leavedate.starts_at > first_leavedate.starts_at and leavedate.starts_at  < last_leavedate.starts_at: 
-                        total -= DAY_DURATION
-
-            logger.debug('total after leaves: ' + str(total))
-        return Decimal(total)
-
-    def hours_performed(self, user, month):
-        total = 0
-        try:
-            performances = models.ActivityPerformance.objects.filter(timesheet__user_id=user, timesheet__month=month)
-        except ObjectDoesNotExist as oe:
-            return Response('Performances not found: ' + str(oe), status=status.HTTP_404_BAD_REQUEST)
-        for performance in performances:
-            total += Decimal(performance.duration)
-        return Decimal(total)
-
-
-class MyUserServiceAPIView(APIView):
-    """
-    Get the currently authenticated user.
-    """
-    permission_classes = (permissions.IsAuthenticated,)
-
-    def get(self, request, format=None):
-        entity = request.user
-        data = serializers.MyUserSerializer(entity, context={'request': request}).data
-        return Response(data)
-
-
-class MyLeaveRequestServiceAPIView(generics.CreateAPIView):
-    """
-    Set the leavedates for the corresponding leave.
-    """
-    queryset = models.LeaveDate.objects.all()
-    serializer_class = serializers.LeaveRequestSerializer
-    permission_classes = (permissions.IsAuthenticated,)
-
-    def create_leavedates(self, this, request):
-        """ Used to handle logic and return the correct response. """
-
-        user = request.user
-        leavedates = request.data
-
-        # Make the datetimes aware of the timezone
-        start = timezone.make_aware(
-            (datetime.strptime(leavedates['starts_at'], "%Y-%m-%dT%H:%M:%S")),
-            timezone.get_current_timezone()
-        )
-        end = timezone.make_aware(
-            (datetime.strptime(leavedates['ends_at'], "%Y-%m-%dT%H:%M:%S")),
-            timezone.get_current_timezone()
-        )
-        leave = int(leavedates['leave'])
-        # timesheet = int(leavedates['timesheet'])
-
-        #If the leave spans across one day only
-        if start.date() == end.date():
-            timesheet, created = models.Timesheet.objects.get_or_create(
-                user=user,
-                year=start.year,
-                month=start.month
-            )
-
-            try:
-                #Create leavedate
-                ld = models.LeaveDate(
-                    leave = models.Leave.objects.get(pk=leave),
-                    timesheet = timesheet,
-                    starts_at = start,
-                    ends_at = end
-                )
-
-                try:
-                    #Validate & save
-                    ld.full_clean()
-                except ValidationError as ve:
-                    return Response('LEAVEDATE -> ValidationError', status = status.HTTP_400_BAD_REQUEST)
-
-                ld.save()
-
-            except ObjectDoesNotExist as oe:
-                return Response('LEAVE -> ObjectDoesNotExist', status = status.HTTP_400_BAD_REQUEST)
-
-            return Response( [leavedates], status = status.HTTP_201_CREATED )
-
-        #If leave spans across several days
-        else:
-            if(end.hour == 0 and end.minute == 0 and end.second == 0):
-                end = end - timedelta(seconds=1)
-
-            days = (end-start).days + 1
-
-            if days < 0:
-                return Response('END DATE SHOULD COME AFTER START DATE', status = status.HTTP_400_BAD_REQUEST)
-
-            new_start = start
-            new_end = end.replace(year=(start.year), month=(start.month), day=(start.day), hour=(23), minute=(59), second=(59))
-
-            my_list = list()
-
-            # Get timesheet, or create it
-            timesheet = models.Timesheet.objects.get_or_create(
-                user=user,
-                year=new_start.year,
-                month=new_start.month
-            )[0]
-            leave_object = models.Leave.objects.get(pk=leave)
-
-            # Create all leavedates ranging from the start to the end
-            for x in range(0, days):
-
-                # If not correct timesheet, get /create it and overwrite
-                if not (timesheet.year == new_start.year and timesheet.month == new_start.month):
-                    timesheet = models.Timesheet.objects.get_or_create(
-                        user=user,
-                        year=new_start.year,
-                        month=new_start.month
-                    )[0]
-
-                temp = models.LeaveDate(
-                    leave=leave_object,
-                    timesheet=timesheet,
-                    starts_at=new_start,
-                    ends_at=new_end
-                )
-
-                # Call validation on the object
-                try:
-                    temp.full_clean()
-                except ValidationError as e:
-                    models.Leave.objects.filter(pk=leave).delete()
-                    return Response(e, status = status.HTTP_400_BAD_REQUEST)
-
-                # Save the object
-                temp.save()
-
-                # Convert object into a list because serializer needs a list
-                my_list.append({
-                    'id': temp.id,
-                    'created_at': temp.created_at,
-                    'updated_at': temp.updated_at,
-                    'leave': temp.leave_id,
-                    'timesheet': temp.timesheet_id,
-                    'starts_at': temp.starts_at,
-                    'ends_at': temp.ends_at
+        for contract_performance in range_info[timesheet.user.id]['summary']['performances']:
+            if (not contracts) or (contract_performance['contract'].id in contracts):
+                data.append({
+                    'contract': contract_performance['contract'],
+                    'duration': contract_performance['duration'],
+                    'standby_days': contract_performance['standby_days'],
+                    'timesheet': timesheet,
                 })
-                new_start += timedelta(days=1)
-                new_end += timedelta(days=1)
 
-                #After initial run, set start time on begin of day
-                if x < 1:
-                    new_start = new_start.replace(hour=(0), minute=(0), second=(0))
-                #Set time to original end when second to last has run
-                if x == days - 2:
-                    new_end = new_end.replace(hour=(end.hour), minute=(end.minute), second=(end.second))
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.TimesheetContractOverviewTable(data)
+    config.configure(table)
 
-            serializer = this.get_serializer(data=my_list, many=True)
-            #Empty call, does nothing (rip)
-            serializer.is_valid(raise_exception=True)
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
 
-            return Response(serializer.data, status = status.HTTP_201_CREATED)
-
-    def patch(self, request, format=None):
-        models.LeaveDate.objects.filter(leave=int(request.data['leave'])).delete()
-        return self.create_leavedates(self, request)
-
-    def post(self, request, format=None):
-        #Return an error saying leavedates already exist for the leave object, or return the created objects
-        if models.LeaveDate.objects.filter(leave=int(request.data['leave'])):
-            return Response('Leavedates are already assigned to this leave object', status = status.HTTP_400_BAD_REQUEST)
-        else:
-            return self.create_leavedates(self, request)
-
-
-class MyLeaveViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows leaves for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyLeaveSerializer
-    filter_class = filters.LeaveFilter
-    permission_classes = (permissions.IsAuthenticated,)
-
-    def get_queryset(self):
-        user = self.request.user
-        return user.leave_set.all()
-
-
-class MyLeaveDateViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows leave dates for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyLeaveDateSerializer
-    filter_class = filters.LeaveDateFilter
-    permission_classes = (permissions.IsAuthenticated,)
-
-    def get_queryset(self):
-        user = self.request.user
-        return models.LeaveDate.objects.filter(leave__user=user)
-
-
-class MyTimesheetViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows timesheets for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyTimesheetSerializer
-    filter_class = filters.TimesheetFilter
-    permission_classes = (permissions.IsAuthenticated,)
-
-    def get_queryset(self):
-        user = self.request.user
-        return user.timesheet_set.exclude(status = models.Timesheet.STATUS.CLOSED)
-
-
-class MyContractViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows contracts for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyContractSerializer
-    filter_class = filters.ContractFilter
-    permission_classes = (permissions.IsAuthenticated,)
-
-    def get_queryset(self):
-        user = self.request.user
-        return models.Contract.objects.filter(contractuser__user=user).distinct()
-
-
-class MyPerformanceViewSet(GenericHierarchicalReadOnlyViewSet):
-    """
-    API endpoint that allows performances for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyPerformanceSerializer
-    serializer_classes = {
-        models.StandbyPerformance: serializers.MyStandbyPerformanceSerializer,
-        models.ActivityPerformance: serializers.MyActivityPerformanceSerializer,
+    context = {
+        'title': _('Timesheet contract overview'),
+        'table': table,
+        'filter': fltr,
     }
-    filter_class = filters.PerformanceFilter
-    permission_classes = (permissions.IsAuthenticated,)
 
-    def get_queryset(self):
-        user = self.request.user
-        return models.Performance.objects.filter(timesheet__user=user)
+    return render(request, 'ninetofiver/admin/reports/timesheet_contract_overview.pug', context)
 
 
-class MyActivityPerformanceViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows activity performances for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyActivityPerformanceSerializer
-    filter_class = filters.ActivityPerformanceFilter
-    permission_classes = (permissions.IsAuthenticated,)
+@staff_member_required
+def admin_report_timesheet_overview_view(request):
+    """Timesheet overview report."""
+    fltr = filters.AdminReportTimesheetOverviewFilter(request.GET, models.Timesheet.objects)
+    timesheets = fltr.qs.select_related('user')
+    company = fltr.data.get('user__employmentcontract__company', None)
+    year = int(fltr.data['year']) if fltr.data.get('year', None) else None
+    month = int(fltr.data['month']) if fltr.data.get('month', None) else None
 
-    def get_queryset(self):
-        user = self.request.user
-        return models.ActivityPerformance.objects.filter(timesheet__user=user)
+    # If we're filtering on company and period (year or year + month), ensure we're only showing timesheets
+    # for users who worked at the company for the period we're filtering on
+    if company and year:
+        period_start, period_end = month_date_range(year, month) if month else (date(year, 1, 1), date(year, 12, 31))
+        timesheets = timesheets.filter(Q(user__employmentcontract__ended_at__isnull=True,
+                                         user__employmentcontract__started_at__lte=period_end) |
+                                       Q(user__employmentcontract__ended_at__isnull=False,
+                                         user__employmentcontract__ended_at__gte=period_start,
+                                         user__employmentcontract__started_at__lte=period_end))
+
+    data = []
+    for timesheet in timesheets:
+        date_range = timesheet.get_date_range()
+        range_info = calculation.get_range_info([timesheet.user], date_range[0], date_range[1])
+        range_info = range_info[timesheet.user.id]
+
+        data.append({
+            'timesheet': timesheet,
+            'range_info': range_info,
+        })
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size * 4})
+    table = tables.TimesheetOverviewTable(data)
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('Timesheet overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/timesheet_overview.pug', context)
 
 
-class MyStandbyPerformanceViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows standby performances for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyStandbyPerformanceSerializer
-    filter_class = filters.StandbyPerformanceFilter
-    permission_classes = (permissions.IsAuthenticated,)
+@staff_member_required
+def admin_report_user_range_info_view(request):
+    """User range info report."""
+    fltr = filters.AdminReportUserRangeInfoFilter(request.GET, models.Timesheet.objects.all())
+    user = get_object_or_404(auth_models.User.objects,
+                             pk=request.GET.get('user', None), is_active=True) if request.GET.get('user') else None
+    from_date = parser.parse(request.GET.get('from_date', None)).date() if request.GET.get('from_date') else None
+    until_date = parser.parse(request.GET.get('until_date', None)).date() if request.GET.get('until_date') else None
 
-    def get_queryset(self):
-        user = self.request.user
-        return models.StandbyPerformance.objects.filter(timesheet__user=user)
+    data = []
+
+    if user and from_date and until_date and (until_date >= from_date):
+        range_info = calculation.get_range_info([user], from_date, until_date, daily=True)[user.id]
+
+        for day in sorted(range_info['details'].keys()):
+            day_detail = range_info['details'][day]
+            data.append({
+                'day_detail': day_detail,
+                'date': parser.parse(day),
+                'user': user,
+            })
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size * 2})
+    table = tables.UserRangeInfoTable(data)
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('User range info'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/user_range_info.pug', context)
 
 
-class MyAttachmentViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows attachments for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyAttachmentSerializer
-    filter_class = filters.AttachmentFilter
-    permission_classes = (permissions.IsAuthenticated,)
+@staff_member_required
+def admin_report_user_leave_overview_view(request):
+    """User leave overview report."""
+    fltr = filters.AdminReportUserLeaveOverviewFilter(request.GET, models.LeaveDate.objects
+                                                      .filter(leave__status=models.STATUS_APPROVED))
+    user = get_object_or_404(auth_models.User.objects,
+                             pk=request.GET.get('user', None), is_active=True) if request.GET.get('user') else None
+    from_date = parser.parse(request.GET.get('from_date', None)).date() if request.GET.get('from_date') else None
+    until_date = parser.parse(request.GET.get('until_date', None)).date() if request.GET.get('until_date') else None
+    data = []
 
-    def get_queryset(self):
-        user = self.request.user
-        return user.attachment_set.all()
+    if user and from_date and until_date and (until_date >= from_date):
+        # Grab timesheets, index them by year, month
+        timesheets = (models.Timesheet.objects
+                      .filter(user=user)
+                      .filter(
+                          Q(year=from_date.year, month__gte=from_date.year) |
+                          Q(year__gt=from_date.year, year__lt=until_date.year) |
+                          Q(year=until_date.year, month__lte=until_date.month)))
+        timesheet_data = {}
+        for timesheet in timesheets:
+            timesheet_data.setdefault(timesheet.year, {})[timesheet.month] = timesheet
+
+        # Grab leave types, index them by ID
+        leave_types = models.LeaveType.objects.all()
+
+        # Grab leave dates, index them by year, then month, then leave type ID
+        leave_dates = fltr.qs.filter().select_related('leave', 'leave__leave_type')
+        leave_date_data = {}
+        for leave_date in leave_dates:
+            (leave_date_data
+                .setdefault(leave_date.starts_at.year, {})
+                .setdefault(leave_date.starts_at.month, {})
+                .setdefault(leave_date.leave.leave_type.id, [])
+                .append(leave_date))
+
+        # Iterate over years, months to create monthly data
+        current_date = copy.deepcopy(from_date)
+        while current_date.strftime('%Y%m') <= until_date.strftime('%Y%m'):
+            month_leave_dates = leave_date_data.get(current_date.year, {}).get(current_date.month, {})
+            month_leave_type_hours = {}
+
+            # Iterate over leave types to gather totals
+            for leave_type in leave_types:
+                duration = sum([Decimal(str(round((x.ends_at - x.starts_at).total_seconds() / 3600, 2)))
+                                for x in month_leave_dates.get(leave_type.id, [])])
+                month_leave_type_hours[leave_type.name] = duration
+
+            data.append({
+                'year': current_date.year,
+                'month': current_date.month,
+                'user': user,
+                'timesheet': timesheet_data.get(current_date.year, {}).get(current_date.month, None),
+                'leave_type_hours': month_leave_type_hours,
+            })
+
+            current_date += relativedelta(months=1)
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.UserLeaveOverviewTable(data)
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('User leave overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/user_leave_overview.pug', context)
 
 
-class MyWorkScheduleViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows workschedules for the currently authenticated user to be viewed or edited.
-    """
-    serializer_class = serializers.MyWorkScheduleSerializer
-    filter_class = filters.WorkScheduleFilter
-    permission_classes = (permissions.IsAuthenticated,)
+@staff_member_required
+def admin_report_user_work_ratio_overview_view(request):
+    """User work ratio overview report."""
+    fltr = filters.AdminReportUserWorkRatioOverviewFilter(request.GET, models.Timesheet.objects)
+    data = []
 
-    def get_queryset(self):
-        user = self.request.user
-        return models.WorkSchedule.objects.filter(employmentcontract__user=user)
+    if fltr.data.get('user', None) and fltr.data.get('year', None):
+        year = int(fltr.data['year'])
+        user = get_object_or_404(auth_models.User.objects,
+                                 pk=request.GET.get('user', None), is_active=True) if request.GET.get('user') else None
+
+        timesheets = fltr.qs.select_related('user').order_by('year', 'month')
+
+        for timesheet in timesheets:
+            date_range = timesheet.get_date_range()
+            range_info = calculation.get_range_info([timesheet.user], date_range[0], date_range[1], summary=True)
+            range_info = range_info[timesheet.user.id]
+
+            total_hours = range_info['performed_hours'] + range_info['leave_hours']
+            leave_hours = range_info['leave_hours']
+            consultancy_hours = sum([x['duration'] for x in range_info['summary']['performances']
+                                    if x['contract'].get_real_instance_class() == models.ConsultancyContract])
+            project_hours = sum([x['duration'] for x in range_info['summary']['performances']
+                                if x['contract'].get_real_instance_class() == models.ProjectContract])
+            support_hours = sum([x['duration'] for x in range_info['summary']['performances']
+                                if x['contract'].get_real_instance_class() == models.SupportContract])
+
+            consultancy_pct = round((consultancy_hours / (total_hours if total_hours else 1.0)) * 100, 2)
+            project_pct = round((project_hours / (total_hours if total_hours else 1.0)) * 100, 2)
+            support_pct = round((support_hours / (total_hours if total_hours else 1.0)) * 100, 2)
+            leave_pct = round((leave_hours / (total_hours if total_hours else 1.0)) * 100, 2)
+
+            data.append({
+                'year': timesheet.year,
+                'month': timesheet.month,
+                'user': timesheet.user,
+                'total_hours': total_hours,
+                'leave_hours': leave_hours,
+                'consultancy_hours': consultancy_hours,
+                'project_hours': project_hours,
+                'support_hours': support_hours,
+                'leave_pct': leave_pct,
+                'consultancy_pct': consultancy_pct,
+                'project_pct': project_pct,
+                'support_pct': support_pct,
+            })
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.UserWorkRatioOverviewTable(data)
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('User work ratio overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/user_work_ratio_overview.pug', context)
+
+
+@staff_member_required
+def admin_report_resource_availability_overview_view(request):
+    """Resource availability overview report."""
+    data = []
+    fltr = filters.AdminReportResourceAvailabilityOverviewFilter(request.GET, models.Timesheet.objects)
+    from_date = parser.parse(request.GET.get('from_date', None)).date() if request.GET.get('from_date') else None
+    until_date = parser.parse(request.GET.get('until_date', None)).date() if request.GET.get('until_date') else None
+
+    users = auth_models.User.objects.filter(is_active=True).distinct()
+    try:
+        user_ids = list(map(int, request.GET.getlist('user', [])))
+        users = users.filter(id__in=user_ids) if user_ids else users
+    except Exception:
+        pass
+    try:
+        group_ids = list(map(int, request.GET.getlist('group', [])))
+        users = users.filter(groups__in=group_ids) if group_ids else users
+    except Exception:
+        pass
+
+    try:
+        contract_ids = list(map(int, request.GET.getlist('contract', [])))
+        users = users.filter(contractuser__contract__in=contract_ids) if contract_ids else users
+    except Exception:
+        pass
+
+    if users and from_date and until_date and (until_date >= from_date):
+        dates = dates_in_range(from_date, until_date)
+
+        # Fetch availability
+        availability = calculation.get_availability_info(users, from_date, until_date)
+
+        # Fetch contract user work schedules
+        contract_user_work_schedules = (models.ContractUserWorkSchedule.objects
+                                        .filter(contract_user__user__in=users)
+                                        .filter(Q(ends_at__isnull=True, starts_at__lte=until_date) |
+                                                Q(ends_at__isnull=False, starts_at__lte=until_date,
+                                                  ends_at__gte=from_date))
+                                        .select_related('contract_user', 'contract_user__user',
+                                                        'contract_user__contract_role', 'contract_user__contract',
+                                                        'contract_user__contract__customer'))
+        # Index contract user work schedules by user
+        contract_user_work_schedule_data = {}
+        for contract_user_work_schedule in contract_user_work_schedules:
+            (contract_user_work_schedule_data
+                .setdefault(contract_user_work_schedule.contract_user.user.id, [])
+                .append(contract_user_work_schedule))
+
+        # Fetch employment contracts
+        employment_contracts = (models.EmploymentContract.objects
+                                .filter(
+                                    (Q(ended_at__isnull=True) & Q(started_at__lte=until_date)) |
+                                    (Q(started_at__lte=until_date) & Q(ended_at__gte=from_date)),
+                                    user__in=users)
+                                .order_by('started_at')
+                                .select_related('user', 'company', 'work_schedule'))
+        # Index employment contracts by user ID
+        employment_contract_data = {}
+        for employment_contract in employment_contracts:
+            (employment_contract_data
+                .setdefault(employment_contract.user.id, [])
+                .append(employment_contract))
+
+        # Iterate over users, days to create daily user data
+        for user in users:
+            user_data = {
+                'user': user,
+                'days': {},
+            }
+            data.append(user_data)
+
+            for current_date in dates:
+                date_str = str(current_date)
+                user_day_data = user_data['days'][date_str] = {}
+
+                day_availability = availability[str(user.id)][date_str]
+                day_contract_user_work_schedules = []
+                day_scheduled_hours = Decimal('0.00')
+                day_work_hours = Decimal('0.00')
+
+                # Get contract user work schedules for this day
+                # This allows us to determine the scheduled hours for this user
+                for contract_user_work_schedule in contract_user_work_schedule_data.get(user.id, []):
+                    if (contract_user_work_schedule.starts_at <= current_date) and \
+                            ((not contract_user_work_schedule.ends_at) or
+                                (contract_user_work_schedule.ends_at >= current_date)):
+                        day_contract_user_work_schedules.append(contract_user_work_schedule)
+                        day_scheduled_hours += getattr(contract_user_work_schedule,
+                                                       current_date.strftime('%A').lower(), Decimal('0.00'))
+
+                # Get employment contract for this day
+                # This allows us to determine the required hours for this user
+                employment_contract = None
+                try:
+                    for ec in employment_contract_data[user.id]:
+                        if (ec.started_at <= current_date) and ((not ec.ended_at) or (ec.ended_at >= current_date)):
+                            employment_contract = ec
+                            break
+                except KeyError:
+                    pass
+
+                work_schedule = employment_contract.work_schedule if employment_contract else None
+                if work_schedule:
+                    day_work_hours = getattr(work_schedule, current_date.strftime('%A').lower(), Decimal('0.00'))
+
+                user_day_data['availability'] = day_availability
+                user_day_data['contract_user_work_schedules'] = day_contract_user_work_schedules
+                user_day_data['scheduled_hours'] = day_scheduled_hours
+                user_day_data['work_hours'] = day_work_hours
+                user_day_data['enough_hours'] = day_scheduled_hours >= day_work_hours
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size * 4})
+    table = tables.ResourceAvailabilityOverviewTable(from_date, until_date, data)
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('Resource availability overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/resource_availability_overview.pug', context)
+
+
+@staff_member_required
+def admin_report_expiring_consultancy_contract_overview_view(request):
+    """Expiring consultancy User work ratio overview report."""
+    fltr = filters.AdminReportExpiringConsultancyContractOverviewFilter(request.GET,
+                                                                        models.ConsultancyContract.objects)
+    ends_at_lte = (parser.parse(request.GET.get('ends_at_lte', None)).date()
+                   if request.GET.get('ends_at_lte') else None)
+    remaining_hours_lte = (Decimal(request.GET.get('remaining_hours_lte'))
+                           if request.GET.get('remaining_hours_lte') else None)
+    remaining_days_lte = (Decimal(request.GET.get('remaining_days_lte'))
+                          if request.GET.get('remaining_days_lte') else None)
+    only_final = request.GET.get('only_final', 'false') == 'true'
+    data = []
+
+    if ends_at_lte or remaining_hours_lte or remaining_days_lte:
+        # If remaining_days_lte * 8 is than remaining_hours_lte, use that instead
+        if remaining_days_lte and ((not remaining_hours_lte) or ((remaining_days_lte * 8) < remaining_hours_lte)):
+            remaining_hours_lte = remaining_days_lte * 8
+
+        contracts = (models.ConsultancyContract.objects.all()
+                     .select_related('customer')
+                     .prefetch_related('contractuser_set', 'contractuser_set__contract_role', 'contractuser_set__user')
+                     .filter(active=True)
+                     # Ensure contracts without end date/duration are never shown, since they will never expire
+                     .filter(Q(ends_at__isnull=False) | Q(duration__isnull=False))
+                     # Ensure contracts where the internal company and the customer are the same are filtered out
+                     # These are internal contracts to cover things such as meetings, talks, etc..
+                     .exclude(customer=F('company')))
+
+        for contract in contracts:
+            alotted_hours = contract.duration
+            performed_hours = (models.ActivityPerformance.objects
+                               .filter(contract=contract)
+                               .aggregate(performed_hours=Sum(F('duration') * F('performance_type__multiplier'))))['performed_hours']
+            performed_hours = performed_hours if performed_hours else Decimal('0.00')
+            remaining_hours = (alotted_hours - performed_hours) if alotted_hours else None
+
+            if (((not ends_at_lte) or (not contract.ends_at) or (contract.ends_at > ends_at_lte)) and
+                ((remaining_hours_lte is None) or (remaining_hours is None) or (remaining_hours > remaining_hours_lte))):
+                continue
+
+            for contract_user in contract.contractuser_set.all():
+                # If we're only supposed to show final consultancy contracts for any given user
+                # AND if the current contract actually has an end date,
+                # ensure the user has no linked active consultancy contracts with a later end date
+                if only_final and contract.ends_at:
+                    final = (models.ConsultancyContract.objects
+                             .filter(contractuser__user=contract_user.user, ends_at__isnull=False,
+                                     ends_at__gte=contract.ends_at, active=True)
+                             .exclude(id=contract.id)
+                             .count()) == 0
+                    if not final:
+                        continue
+
+                data.append({
+                    'contract': contract,
+                    'contract_user': contract_user,
+                    'user': contract_user.user,
+                    'alotted_hours': alotted_hours,
+                    'performed_hours': performed_hours,
+                    'remaining_hours': remaining_hours,
+                })
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.ExpiringConsultancyContractOverviewTable(data, order_by='ends_at')
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('Expiring consultancy contract overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/expiring_consultancy_contract_overview.pug', context)
+
+
+@staff_member_required
+def admin_report_project_contract_overview_view(request):
+    """Project contract overview report."""
+    fltr = filters.AdminReportProjectContractOverviewFilter(request.GET, models.ProjectContract.objects)
+    data = []
+
+    if True in map(bool, list(fltr.data.values())):
+        contracts = (fltr.qs.all()
+                    .select_related('customer')
+                    .prefetch_related('contractestimate_set', 'contractestimate_set__contract_role')
+                    .filter(active=True)
+                    # Ensure contracts where the internal company and the customer are the same are filtered out
+                    # These are internal contracts to cover things such as meetings, talks, etc..
+                    .exclude(customer=F('company')))
+
+        for contract in contracts:
+            # Keep track of totals
+            performed_hours = Decimal('0.00')
+            estimated_hours = Decimal('0.00')
+
+            # List containing estimated and performed hours per role
+            contract_role_data = {}
+            # List containing performed hours per country
+            country_data = {}
+            # List containing performed hours per user
+            user_data = {}
+
+            # Fetch each performance for the contract, annotated with country
+            performances = (models.ActivityPerformance.objects
+                            .select_related('performance_type', 'contract_role', 'timesheet__user', 'timesheet__user__userinfo')
+                            .filter(contract=contract))
+
+            # Iterate over estimates to populate contract role data
+            for contract_estimate in contract.contractestimate_set.all():
+                estimated_hours += contract_estimate.duration
+
+                if contract_estimate.contract_role:
+                    contract_role_data[contract_estimate.contract_role.id] = {
+                        'contract_role': contract_estimate.contract_role,
+                        'performed_hours': Decimal('0.00'),
+                        'estimated_hours': contract_estimate.duration,
+                    }
+
+            # Iterate over performance and fill in performed data
+            for performance in performances:
+                country = (performance.timesheet.user.userinfo.country
+                        if (performance.timesheet.user.userinfo and performance.timesheet.user.userinfo.country)
+                        else 'Other')
+                if country not in country_data:
+                    country_data[country] = {
+                        'country': country,
+                        'performed_hours': Decimal('0.00'),
+                    }
+
+                user = performance.timesheet.user
+                if user.id not in user_data:
+                    user_data[user.id] = {
+                        'user': user,
+                        'performed_hours': Decimal('0.00'),
+                    }
+
+                contract_role = performance.contract_role
+                if contract_role.id not in contract_role_data:
+                    contract_role_data[contract_role.id] = {
+                        'contract_role': contract_role,
+                        'performed_hours': Decimal('0.00'),
+                        'estimated_hours': Decimal('0.00'),
+                    }
+
+                duration = performance.normalized_duration
+                performed_hours += duration
+                contract_role_data[performance.contract_role.id]['performed_hours'] += duration
+                country_data[country]['performed_hours'] += duration
+                user_data[user.id]['performed_hours'] += duration
+
+            # Iterate over contract role, user, country data and calculate performed_pct
+            for contract_role_id, item in contract_role_data.items():
+                item['performed_pct'] = round((item['performed_hours'] / performed_hours) * 100, 2) if performed_hours else None
+                item['estimated_pct'] = round((item['performed_hours'] / item['estimated_hours']) * 100, 2) if item['estimated_hours'] else None
+            for user_id, item in user_data.items():
+                item['performed_pct'] = round((item['performed_hours'] / performed_hours) * 100, 2) if performed_hours else None
+            for country, item in country_data.items():
+                item['performed_pct'] = round((item['performed_hours'] / performed_hours) * 100, 2) if performed_hours else None
+
+            # Fetch invoiced amount
+            invoiced_amount = (models.InvoiceItem.objects
+                    .filter(invoice__contract=contract)
+                    .aggregate(invoiced_amount=Sum(F('price') * F('amount'),
+                                                   output_field=DecimalField(max_digits=9, decimal_places=2))))['invoiced_amount']
+            invoiced_amount = invoiced_amount if invoiced_amount else Decimal('0.00')
+
+            data.append({
+                'contract': contract,
+                'contract_roles': contract_role_data.values(),
+                'countries': country_data.values(),
+                'users': user_data.values(),
+                'performed_hours': performed_hours,
+                'estimated_hours': estimated_hours,
+                'estimated_pct': round((performed_hours / estimated_hours) * 100, 2) if estimated_hours else None,
+                'invoiced_amount': invoiced_amount,
+                'invoiced_pct': round((invoiced_amount / contract.fixed_fee) * 100, 2) if contract.fixed_fee else None,
+            })
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.ProjectContractOverviewTable(data)
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('Project contract overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/project_contract_overview.pug', context)
+
+
+@staff_member_required
+def admin_report_user_overtime_overview_view(request):
+    """User overtime overview report."""
+    fltr = filters.AdminReportUserOvertimeOverviewFilter(request.GET, models.LeaveDate.objects
+                                                         .filter(leave__status=models.STATUS_APPROVED))
+    user = get_object_or_404(auth_models.User.objects,
+                             pk=request.GET.get('user', None), is_active=True) if request.GET.get('user') else None
+    from_date = parser.parse(request.GET.get('from_date', None)).date() if request.GET.get('from_date') else None
+    until_date = parser.parse(request.GET.get('until_date', None)).date() if request.GET.get('until_date') else None
+    data = []
+
+    overtime_leave_type_ids = list(models.LeaveType.objects.filter(overtime=True).values_list('id', flat=True))
+
+    if user and from_date and until_date and (until_date >= from_date) and overtime_leave_type_ids:
+        # Grab leave dates, index them by year, then month, then leave type ID
+        leave_dates = fltr.qs.filter(leave__leave_type__id__in=overtime_leave_type_ids).select_related('leave')
+        leave_date_data = {}
+        for leave_date in leave_dates:
+            (leave_date_data
+                .setdefault(leave_date.starts_at.year, {})
+                .setdefault(leave_date.starts_at.month, [])
+                .append(leave_date))
+
+        # Iterate over years, months to create monthly data
+        current_date = copy.deepcopy(from_date)
+        remaining_overtime_hours = Decimal('0.00')
+
+        while current_date.strftime('%Y%m') <= until_date.strftime('%Y%m'):
+            current_date_range = month_date_range(current_date.year, current_date.month)
+            month_range_info = calculation.get_range_info([user], from_date=current_date_range[0],
+                                                          until_date=current_date_range[1])
+
+            overtime_hours = month_range_info[user.id]['overtime_hours']
+            remaining_overtime_hours += overtime_hours
+
+            remaining_hours = month_range_info[user.id]['remaining_hours']
+            remaining_overtime_hours -= remaining_hours
+
+            used_overtime_hours = sum([Decimal(str(round((x.ends_at - x.starts_at).total_seconds() / 3600, 2)))
+                                      for x in leave_date_data.get(current_date.year, {}).get(current_date.month, {})])
+            remaining_overtime_hours -= used_overtime_hours
+
+            data.append({
+                'year': current_date.year,
+                'month': current_date.month,
+                'user': user,
+                'overtime_hours': overtime_hours,
+                'remaining_hours': remaining_hours,
+                'used_overtime_hours': used_overtime_hours,
+                'remaining_overtime_hours': remaining_overtime_hours,
+            })
+
+            current_date += relativedelta(months=1)
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.UserOvertimeOverviewTable(data)
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('User overtime overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/user_overtime_overview.pug', context)
+
+
+@staff_member_required
+def admin_report_expiring_support_contract_overview_view(request):
+    """Expiring support contract overview report."""
+    fltr = filters.AdminReportExpiringSupportContractOverviewFilter(request.GET,
+                                                                    models.SupportContract.objects)
+    ends_at_lte = (parser.parse(request.GET.get('ends_at_lte', None)).date()
+                   if request.GET.get('ends_at_lte') else None)
+    data = []
+
+    if ends_at_lte:
+        contracts = (models.SupportContract.objects.all()
+                     .select_related('customer')
+                     .filter(active=True)
+                     # Ensure contracts without end date/duration are never shown, since they will never expire
+                     .filter(Q(ends_at__isnull=False, ends_at__lte=ends_at_lte))
+                     # Ensure contracts where the internal company and the customer are the same are filtered out
+                     # These are internal contracts to cover things such as meetings, talks, etc..
+                     .exclude(customer=F('company')))
+
+        for contract in contracts:
+            performed_hours = (models.ActivityPerformance.objects
+                               .filter(contract=contract)
+                               .aggregate(performed_hours=Sum(F('duration') * F('performance_type__multiplier'))))['performed_hours']
+            performed_hours = performed_hours if performed_hours else Decimal('0.00')
+
+            data.append({
+                'contract': contract,
+                'performed_hours': performed_hours,
+            })
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.ExpiringSupportContractOverviewTable(data, order_by='ends_at')
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('Expiring support contract overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/expiring_support_contract_overview.pug', context)
+
+
+@staff_member_required
+def admin_report_project_contract_budget_overview_view(request):
+    """Project contract budget overview report."""
+    fltr = filters.AdminReportProjectContractOverviewFilter(request.GET, models.ProjectContract.objects)
+    data = []
+
+    contracts = (fltr.qs.all()
+                 .select_related('customer')
+                 .filter(active=True)
+                 # Ensure contracts where the internal company and the customer are the same are filtered out
+                 # These are internal contracts to cover things such as meetings, talks, etc..
+                 .exclude(customer=F('company')))
+
+    for contract in contracts:
+        performed_hours = (models.ActivityPerformance.objects
+                            .filter(contract=contract)
+                            .aggregate(performed_hours=Sum(F('duration') * F('performance_type__multiplier'))))['performed_hours']
+        performed_hours = performed_hours if performed_hours else Decimal('0.00')
+
+        estimated_hours = (models.ContractEstimate.objects
+                            .filter(contract=contract)
+                            .aggregate(estimated_hours=Sum('duration')))['estimated_hours']
+        estimated_hours = estimated_hours if estimated_hours else Decimal('0.00')
+
+        invoiced_amount = (models.InvoiceItem.objects
+                            .filter(invoice__contract=contract)
+                            .aggregate(invoiced_amount=Sum(F('price') * F('amount'),
+                                        output_field=DecimalField(max_digits=9, decimal_places=2))))['invoiced_amount']
+        invoiced_amount = invoiced_amount if invoiced_amount else Decimal('0.00')
+
+        performance_cost = Decimal('0.00')
+
+        data.append({
+            'contract': contract,
+            'performed_hours': performed_hours,
+            'estimated_hours': estimated_hours,
+            'estimated_pct': round((performed_hours / estimated_hours) * 100, 2) if estimated_hours else None,
+            'invoiced_amount': invoiced_amount,
+            'invoiced_pct': round((invoiced_amount / contract.fixed_fee) * 100, 2) if contract.fixed_fee else None,
+            'performance_cost': performance_cost,
+            'fixed_fee_pct': round((performance_cost / contract.fixed_fee) * 100, 2) if contract.fixed_fee else None,
+        })
+
+    config = RequestConfig(request, paginate={'per_page': pagination.CustomizablePageNumberPagination.page_size})
+    table = tables.ProjectContractBudgetOverviewTable(data, order_by='-performed')
+    config.configure(table)
+
+    export_format = request.GET.get('_export', None)
+    if TableExport.is_valid_format(export_format):
+        exporter = TableExport(export_format, table)
+        return exporter.response('table.{}'.format(export_format))
+
+    context = {
+        'title': _('Project contract budget overview'),
+        'table': table,
+        'filter': fltr,
+    }
+
+    return render(request, 'ninetofiver/admin/reports/project_contract_budget_overview.pug', context)
+
+
+class AdminTimesheetContractPdfExportView(BaseTimesheetContractPdfExportServiceAPIView):
+    """Export a timesheet contract to PDF."""
+
+    permission_classes = (permissions.IsAdminUser,)
+
+    def resolve_user_timesheet_contracts(self, context):
+        """Resolve users, timesheets and contracts for this report."""
+        data = context.get('user_timesheet_contract_pks', None)
+        data = [list(map(int, x.split(':'))) for x in data.split(',')]
+
+        for item in data:
+            item[0] = get_object_or_404(auth_models.User.objects.filter().distinct(), pk=item[0])
+            item[1] = get_object_or_404(models.Timesheet.objects.filter().distinct(), pk=item[1], user=item[0])
+            item[2] = get_object_or_404(models.Contract.objects.filter().distinct(), pk=item[2])
+
+        return data

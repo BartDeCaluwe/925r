@@ -1,0 +1,18 @@
+.report-table > .table-container {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+}
+
+.report-table .dropdown-toggle-no-caret::after {
+    border: none;
+    margin-left: 0;
+}
+
+#container #header {
+    height: auto;
+}
+
+#container #header #site-name {
+    line-height: inherit;
+}

@@ -7,66 +7,27 @@ from django.views.generic.base import TemplateView
 from rest_framework import routers
 # from rest_framework.urlpatterns import format_suffix_patterns
 from django_downloadview import ObjectDownloadView
-from ninetofiver import models
-from ninetofiver import views
 from oauth2_provider import views as oauth2_views
 from registration.backends.hmac import views as registration_views
+from ninetofiver import views, models
+
 
 urlpatterns = [
-    url(r'^api/$', views.schema_view, name='api_docs'),
+    url(r'^api/v2/', include('ninetofiver.api_v2.urls', namespace='ninetofiver_api_v2')),
 ]
 
 router = routers.DefaultRouter()
-router.register(r'users', views.UserViewSet)
-router.register(r'groups', views.GroupViewSet)
-router.register(r'companies', views.CompanyViewSet)
-router.register(r'employment_contract_types', views.EmploymentContractTypeViewSet)
-router.register(r'employment_contracts', views.EmploymentContractViewSet)
-router.register(r'work_schedules', views.WorkScheduleViewSet)
-router.register(r'user_relatives', views.UserRelativeViewSet)
-router.register(r'holidays', views.HolidayViewSet)
-router.register(r'leave_types', views.LeaveTypeViewSet)
-router.register(r'leaves', views.LeaveViewSet)
-router.register(r'leave_dates', views.LeaveDateViewSet)
-router.register(r'performance_types', views.PerformanceTypeViewSet)
-router.register(r'contracts/project', views.ProjectContractViewSet)
-router.register(r'contracts/consultancy', views.ConsultancyContractViewSet)
-router.register(r'contracts/support', views.SupportContractViewSet)
-router.register(r'contracts', views.ContractViewSet)
-router.register(r'contract_roles', views.ContractRoleViewSet)
-router.register(r'contract_users', views.ContractUserViewSet)
-router.register(r'contract_groups', views.ContractGroupViewSet)
-router.register(r'timesheets', views.TimesheetViewSet)
-router.register(r'whereabouts', views.WhereaboutViewSet)
-router.register(r'performances/activity', views.ActivityPerformanceViewSet)
-router.register(r'performances/standby', views.StandbyPerformanceViewSet)
-router.register(r'performances', views.PerformanceViewSet)
-router.register(r'project_estimates', views.ProjectEstimateViewSet)
-router.register(r'attachments', views.AttachmentViewSet)
-router.register(r'my_leaves', views.MyLeaveViewSet, base_name='myleave')
-router.register(r'my_leave_dates', views.MyLeaveDateViewSet, base_name='myleavedate')
-router.register(r'my_timesheets', views.MyTimesheetViewSet, base_name='mytimesheet')
-router.register(r'my_contracts', views.MyContractViewSet, base_name='mycontract')
-router.register(r'my_performances/activity', views.MyActivityPerformanceViewSet, base_name='myactivityperformance')
-router.register(r'my_performances/standby', views.MyStandbyPerformanceViewSet, base_name='mystandbyperformance')
-router.register(r'my_performances', views.MyPerformanceViewSet, base_name='myperformance')
-router.register(r'my_attachments', views.MyAttachmentViewSet, base_name='myattachment')
-router.register(r'my_workschedules', views.MyWorkScheduleViewSet, base_name='myworkschedule')
 
 # Wire up our API using automatic URL routing.
-# Additionally, we include login URLs for the browsable API.
+# Additionally, we include login URLs for the browseable API.
 urlpatterns += [
     url(r'^$', views.home_view, name='home'),
-    url(r'^api/v1/', include(router.urls + [
-        url(r'^services/my_user/$', views.MyUserServiceAPIView.as_view(), name='my_user_service'),
-        url(r'^services/my_leave_request/$', views.MyLeaveRequestServiceAPIView.as_view(), name='my_leave_request_service'),
-        url(r'^services/time_entry_import/$', views.TimeEntryImportServiceAPIView.as_view(), name='time_entry_import_service'),
-        url(r'^services/month_info/$', views.MonthInfoServiceAPIView.as_view(), name='month_info_service'),
-        url(r'^services/download_attachment/(?P<slug>[A-Za-z0-9_-]+)/$', ObjectDownloadView.as_view(model=models.Attachment, file_field='file'), name='download_attachment_service')
-    ])),
+    url(r'^api-docs/$', views.api_docs_view, name='api_docs'),
+    url(r'^api-docs/swagger_ui/$', views.api_docs_swagger_ui_view, name='api_docs_swagger_ui'),
+    url(r'^api-docs/redoc/$', views.api_docs_redoc_view, name='api_docs_redoc'),
     url(r'^api-auth/', include('rest_framework.urls', namespace='rest_framework')),
 
-    # # OAuth2
+    # OAuth2
     url(r'^oauth/v2/', include(
         [
             url(r'^authorize/$', oauth2_views.AuthorizationView.as_view(template_name='ninetofiver/oauth2/authorize.pug'), name="authorize"),
@@ -87,6 +48,10 @@ urlpatterns += [
     url(r'^accounts/profile/$', views.account_view, name='account'),
     url(r'^accounts/password/change/$', auth_views.password_change, {'template_name': 'ninetofiver/account/password_change.pug'}, name='password_change'),
     url(r'^accounts/password/change/done/$', auth_views.password_change_done, {'template_name': 'ninetofiver/account/password_change_done.pug'}, name='password_change_done'),
+
+    url(r'^accounts/api_keys/$', views.ApiKeyListView.as_view(), name='api-key-list'),
+    url(r'^accounts/api_keys/create/$', views.ApiKeyCreateView.as_view(), name='api-key-create'),
+    url(r'^accounts/api_keys/(?P<pk>\d+)/delete/$', views.ApiKeyDeleteView.as_view(), name='api-key-delete'),
 
     # Auth
     url(r'^auth/login/$', auth_views.login, {'template_name': 'ninetofiver/authentication/login.pug'}, name='login'),
@@ -128,6 +93,31 @@ urlpatterns += [
         TemplateView.as_view(template_name='ninetofiver/registration/register_closed.pug'),
         name='registration_disallowed',
     ),
+
+    # Silk (profiling)
+    url(r'^admin/silk/', include('silk.urls', namespace='silk')),
+
+    # Django SQL explorer
+    url(r'^admin/sqlexplorer/', include('explorer.urls')),
+
+    # Custom admin routes
+    url(r'^admin/ninetofiver/leave/approve/(?P<leave_pk>[0-9,]+)/$', views.admin_leave_approve_view, name='admin_leave_approve'),  # noqa
+    url(r'^admin/ninetofiver/leave/reject/(?P<leave_pk>[0-9,]+)/$', views.admin_leave_reject_view, name='admin_leave_reject'),  # noqa
+    url(r'^admin/ninetofiver/timesheet/close/(?P<timesheet_pk>[0-9,]+)/$', views.admin_timesheet_close_view, name='admin_timesheet_close'),  # noqa
+    url(r'^admin/ninetofiver/timesheet/activate/(?P<timesheet_pk>[0-9,]+)/$', views.admin_timesheet_activate_view, name='admin_timesheet_activate'),  # noqa
+    url(r'^admin/ninetofiver/report/$', views.admin_report_index_view, name='admin_report_index'),  # noqa
+    url(r'^admin/ninetofiver/report/timesheet_contract_overview/$', views.admin_report_timesheet_contract_overview_view, name='admin_report_timesheet_contract_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/timesheet_overview/$', views.admin_report_timesheet_overview_view, name='admin_report_timesheet_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/user_range_info/$', views.admin_report_user_range_info_view, name='admin_report_user_range_info'),  # noqa
+    url(r'^admin/ninetofiver/report/user_leave_overview/$', views.admin_report_user_leave_overview_view, name='admin_report_user_leave_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/user_work_ratio_overview/$', views.admin_report_user_work_ratio_overview_view, name='admin_report_user_work_ratio_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/user_overtime_overview/$', views.admin_report_user_overtime_overview_view, name='admin_report_user_overtime_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/resource_availability_overview/$', views.admin_report_resource_availability_overview_view, name='admin_report_resource_availability_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/expiring_consultancy_contract_overview/$', views.admin_report_expiring_consultancy_contract_overview_view, name='admin_report_expiring_consultancy_contract_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/expiring_support_contract_overview/$', views.admin_report_expiring_support_contract_overview_view, name='admin_report_expiring_support_contract_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/project_contract_overview/$', views.admin_report_project_contract_overview_view, name='admin_report_project_contract_overview'),  # noqa
+    url(r'^admin/ninetofiver/report/project_contract_budget_overview/$', views.admin_report_project_contract_budget_overview_view, name='admin_report_project_contract_budget_overview'),  # noqa
+    url(r'^admin/ninetofiver/timesheet_contract_pdf_export/(?P<user_timesheet_contract_pks>[0-9:,]+)/$', views.AdminTimesheetContractPdfExportView.as_view(), name='admin_timesheet_contract_pdf_export'),  # noqa
 
     # Admin
     url(r'^admin/', admin.site.urls),

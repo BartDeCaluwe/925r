@@ -1,0 +1,9 @@
+extends ninetofiver/emails/mail_generic.pug
+
+block content
+    p Dear {{ user }},
+    p The leave you requested has been marked as '{{ leave.status }}'.
+        | <br>
+        | More details can be found below.
+
+    include ninetofiver/emails/partials/leave_vertical.pug

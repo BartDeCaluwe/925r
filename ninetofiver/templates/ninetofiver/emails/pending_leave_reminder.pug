@@ -1,0 +1,25 @@
+extends ninetofiver/emails/mail_generic.pug
+
+block content
+    p Dear {{ user }},
+    p There {{ leave_count|pluralize:"is,are" }} {{ leave_count }} pending leave awaiting your approval.
+    
+    p
+        a(href='{{ settings.BASE_URL }}{% url "admin_leave_approve" leave_pk=leave_ids %}' style="
+            background: #79aec8;
+            border-radius: 4px;
+            color: #fff;
+            padding: 4px 5px;
+            text-decoration: none;
+        ") Approve all
+        | &nbsp;&nbsp;&nbsp;&nbsp;
+        a(href='{{ settings.BASE_URL }}/admin/ninetofiver/leave/?status__exact=pending' style="
+            background: #79aec8;
+            border-radius: 4px;
+            color: #fff;
+            padding: 4px 5px;
+            text-decoration: none;
+        ") View all
+        
+    - var show_leave_approval_actions = True
+    include ninetofiver/emails/partials/leaves_horizontal.pug

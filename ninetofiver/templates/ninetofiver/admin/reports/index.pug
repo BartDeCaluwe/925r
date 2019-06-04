@@ -1,0 +1,40 @@
+extends ninetofiver/admin/reports/base.pug
+
+
+block content
+    hr
+    table(class="table table-bordered table-striped")
+      tbody
+        tr
+          th
+            a(href="{% url 'admin_report_timesheet_contract_overview' %}?year={{ today|date:'Y' }}&month={{ today|date:'n' }}") Timesheet contract overview
+        tr
+          th
+            a(href="{% url 'admin_report_timesheet_overview' %}?year={{ today|date:'Y' }}&month={{ today|date:'n' }}") Timesheet overview
+        tr
+          th
+            a(href="{% url 'admin_report_user_range_info' %}?from_date={{ last_week|date:'Y-m-d' }}&until_date={{ today|date:'Y-m-d' }}&user={{ user.id }}") User range info
+        tr
+          th
+            a(href="{% url 'admin_report_user_leave_overview' %}?from_date={{ last_week|date:'Y-m-d' }}&until_date={{ today|date:'Y-m-d' }}&user={{ user.id }}") User leave overview
+        tr
+          th
+            a(href="{% url 'admin_report_user_work_ratio_overview' %}?year={{ today|date:'Y' }}&user={{ user.id }}") User work ratio overview
+        tr
+          th
+            a(href="{% url 'admin_report_user_overtime_overview' %}?from_date={{ last_week|date:'Y-m-d' }}&until_date={{ today|date:'Y-m-d' }}&user={{ user.id }}") User overtime overview
+        tr
+          th
+            a(href="{% url 'admin_report_resource_availability_overview' %}?from_date={{ today|date:'Y-m-d' }}&until_date={{ next_month|date:'Y-m-d' }}") Resource availability overview
+        tr
+          th
+            a(href="{% url 'admin_report_expiring_consultancy_contract_overview' %}?ends_at_lte={{ two_months_from_now|date:'Y-m-d' }}&remaining_hours_lte={{ '160' }}") Expiring consultancy contract overview
+        tr
+          th
+            a(href="{% url 'admin_report_expiring_support_contract_overview' %}?ends_at_lte={{ two_months_from_now|date:'Y-m-d' }}") Expiring support contract overview
+        tr
+          th
+            a(href="{% url 'admin_report_project_contract_overview' %}") Project contract overview
+        tr
+          th
+            a(href="{% url 'admin_report_project_contract_budget_overview' %}") Project contract budget overview

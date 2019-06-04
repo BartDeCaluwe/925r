@@ -1,0 +1,11 @@
+td * {
+    margin-bottom: 0;
+}
+
+.nobreak {
+    page-break-inside: avoid;
+}
+
+.break {
+    page-break-before: always;
+}

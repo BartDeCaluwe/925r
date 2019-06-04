@@ -1,0 +1,11 @@
+extends ninetofiver/emails/mail_generic.pug
+
+block content
+    p Dear {{ user }},
+    p You have {{ timesheet_count }} active timesheet{{ timesheet_count|pluralize:"s" }} due for submission.
+        | <br>
+        | Please ensure all of your due timesheets are filled in correctly and submit them for review.
+        | <br>
+        | More details can be found below.
+
+    include ninetofiver/emails/partials/timesheets_horizontal.pug
