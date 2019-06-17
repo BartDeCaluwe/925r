@@ -1191,3 +1191,20 @@ class InvoiceItem(BaseModel):
     )
     amount = models.PositiveIntegerField(default=1)
     description = models.TextField(max_length=255, blank=True, null=True)
+
+
+class ExternalApplication(BaseModel):
+
+    """External application."""
+
+    name = models.CharField(max_length=255)
+    base_url = models.CharField(max_length=255)
+
+
+class ExternalApplicationUser(BaseModel):
+
+    """External application user."""
+
+    user_info = models.ForeignKey(UserInfo, on_delete=models.PROTECT)
+    external_application = models.ForeignKey(ExternalApplication, on_delete=models.PROTECT)
+    api_key = models.CharField(max_length=255)
