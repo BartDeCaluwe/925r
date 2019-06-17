@@ -327,6 +327,13 @@ class Base(Configuration):
     REDMINE_API_KEY = values.Value(None)
     REDMINE_ISSUE_CONTRACT_FIELD = values.Value('925r_contract')
 
+    # TOGGL
+    TOGGL_API_KEY = values.Value(None)
+    TOGGL_PASSWORD = values.Value(None)
+    TOGGL_WORKSPACE_ID = values.Value(None)
+    TOGGL_USER_AGENT = values.Value('925r')
+    TOGGL_URL = values.Value(None)
+
     EMAIL_HOST = values.Value('localhost')
     EMAIL_PORT = values.Value(25)
     EMAIL_BACKEND = values.Value('django.core.mail.backends.smtp.EmailBackend')
