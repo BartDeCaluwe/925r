@@ -55,7 +55,7 @@ components:
           tokenUrl: /oauth/v2/token/
           refreshUrl: /oauth/v2/token/
           scopes: []
-  
+
   parameters:
     page:
       name: page
@@ -512,12 +512,12 @@ paths:
   /me/:
     get:
       operationId: getMe
-      responses: 
+      responses:
         200:
           description: The currently authenticated user
           content:
             application/json:
-              schema: 
+              schema:
                 $ref: '#/components/schemas/Me'
 
   /users/:
@@ -583,7 +583,7 @@ paths:
           in: query
           schema:
             type: number
-      responses: 
+      responses:
         200:
           description: List of users
           content:
@@ -1637,7 +1637,7 @@ paths:
       responses:
         204:
           description: An attachment
-  
+
   /downloads/attachments/{slug}/:
     parameters:
       - name: slug
@@ -1695,6 +1695,11 @@ paths:
     get:
       operationId: getPerformanceImports
       parameters:
+        - name: tracker
+          schema:
+            type: string
+          in: query
+          required: false
         - name: from
           schema:
             type: string
