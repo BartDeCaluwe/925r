@@ -10,7 +10,7 @@ from rest_framework import mixins, permissions, viewsets, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from ninetofiver.api_v2 import serializers, filters
-from ninetofiver import models, feeds, calculation, redmine
+from ninetofiver import models, feeds, calculation, redmine, toggl
 from ninetofiver.views import BaseTimesheetContractPdfExportServiceAPIView
 
 
@@ -253,6 +253,7 @@ class PerformanceImportAPIView(APIView):
     permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request, format=None):
+        tracker = request.query_params.get('tracker')
         from_date = request.query_params.get('from', str(datetime.date.today()))
         until_date = request.query_params.get('until', str(datetime.date.today()))
 
@@ -263,11 +264,15 @@ class PerformanceImportAPIView(APIView):
             'results': [],
         }
 
-        # Redmine
-        redmine_data = redmine.get_user_redmine_performances(request.user, from_date=from_date, to_date=until_date)
-        data['results'] += redmine_data
-        data['count'] = len(data['results'])
+        if tracker and tracker == 'toggl':
+            toggl_data = toggl.get_user_performances(request.user, from_date=from_date, to_date=until_date)
+            data['results'] += toggl_data
+        else:
+            # Redmine
+            redmine_data = redmine.get_user_redmine_performances(request.user, from_date=from_date, to_date=until_date)
+            data['results'] += redmine_data
 
+        data['count'] = len(data['results'])
         return Response(data)
 
 
